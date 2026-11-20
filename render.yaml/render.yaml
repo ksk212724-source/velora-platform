@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: velora-platform-api
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python render_entry.py
+    healthCheckPath: /health
+    envVars:
+      - key: ALLOW_BROWSER
+        value: "1"
