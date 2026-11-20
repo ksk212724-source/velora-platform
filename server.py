@@ -198,6 +198,9 @@ create table if not exists prices(key text primary key, rub int, stars int);
 create table if not exists admins(uid integer primary key, t real);
 create table if not exists revoked(uid text, item text, primary key(uid, item));
 create table if not exists bans(uid text primary key, reason text, t real);
+create table if not exists remote_devices(id text primary key, secret_hash text not null, name text not null, owner text, paired int not null default 0);
+create table if not exists remote_codes(code text primary key, device text not null, expires real not null);
+create table if not exists remote_tokens(token_hash text primary key, device text not null, owner text not null);
 """)
 for _sql in ("alter table users add column lk real default 0",
              "alter table users add column plan text default ''",
@@ -224,6 +227,39 @@ SESSION_TTL = int(os.getenv("SESSION_TTL", str(6 * 3600)))
 APP_MSG_TTL = int(os.getenv("APP_MSG_TTL", "45"))
 open_msgs: dict = {}
 lock = threading.Lock()
+remote_codes: dict = {}       # code -> {device, expires, fails}
+remote_devices: dict = {}     # id -> in-memory laptop session
+remote_tokens: dict = {}      # sha256(token) -> (device_id, owner_uid)
+remote_attempts: dict = {}    # ip -> timestamps
+
+# Keep pairing identities across Render free-instance sleep/restarts. Live queues and
+# pending tool calls remain in memory; clients reconnect and retry them after a wake.
+for _did, _secret_hash, _name, _owner, _paired in db.execute(
+        "select id,secret_hash,name,owner,paired from remote_devices").fetchall():
+    remote_devices[_did] = {"secret_hash": _secret_hash, "name": _name, "online": False,
+                            "last": 0, "queue": [], "pending": {}, "inbox": [],
+                            "paired": bool(_paired), "owner": _owner, "halted": False,
+                            "wake": threading.Event()}
+for _code, _did, _expires in db.execute(
+        "select code,device,expires from remote_codes where expires > ?", (time.time(),)).fetchall():
+    remote_codes[_code] = {"device": _did, "expires": _expires}
+for _token_hash, _did, _owner in db.execute(
+        "select token_hash,device,owner from remote_tokens").fetchall():
+    remote_tokens[_token_hash] = (_did, _owner)
+
+
+def _remote_device_auth(body):
+    d = remote_devices.get(str(body.get("device", "")))
+    if not d or not body.get("secret"):
+        return None
+    got = hashlib.sha256(str(body["secret"]).encode()).hexdigest()
+    return d if hmac.compare_digest(got, d["secret_hash"]) else None
+
+
+def _remote_user():
+    token = request.headers.get("Authorization", "").removeprefix("Bearer ")
+    item = remote_tokens.get(hashlib.sha256(token.encode()).hexdigest()) if token else None
+    return (item, remote_devices.get(item[0])) if item else (None, None)
 
 
 # ---------- защита ----------
@@ -1060,6 +1096,163 @@ def tts():
     except Exception as e:  # noqa: BLE001
         print("TTS", type(e).__name__, str(e)[:200])
         return jsonify(error="Озвучка недоступна"), 502
+
+
+@app.post("/api/remote/register")
+def remote_register():
+    b = request.get_json(silent=True) or {}
+    code = str(b.get("code", ""))
+    if not re.fullmatch(r"\d{6}", code):
+        return jsonify(error="Нужен 6-значный код"), 400
+    now = time.time()
+    with lock:
+        for old_code in [c for c, v in remote_codes.items() if v["expires"] <= now]:
+            remote_codes.pop(old_code, None)
+            db.execute("delete from remote_codes where code=?", (old_code,))
+        old = remote_codes.get(code)
+        if old and old["expires"] > now:
+            return jsonify(error="Код уже используется"), 409
+        did, secret = uuid.uuid4().hex, secrets.token_urlsafe(32)
+        remote_devices[did] = {"secret_hash": hashlib.sha256(secret.encode()).hexdigest(),
+                               "name": str(b.get("device") or "Mac")[:80], "online": False,
+                               "last": 0, "queue": [], "pending": {}, "inbox": [], "paired": False,
+                               "owner": None, "halted": False, "wake": threading.Event()}
+        remote_codes[code] = {"device": did, "expires": now + 600}
+        db.execute("insert into remote_devices(id,secret_hash,name,owner,paired) values(?,?,?,?,0)",
+                   (did, remote_devices[did]["secret_hash"], remote_devices[did]["name"], None))
+        db.execute("insert into remote_codes(code,device,expires) values(?,?,?)", (code, did, now + 600))
+        db.commit()
+    return jsonify(device=did, secret=secret, expires_in=600)
+
+
+@app.post("/api/remote/pair")
+def remote_pair():
+    check_access()
+    ip = client_ip(); now = time.time()
+    attempts = [t for t in remote_attempts.get(ip, []) if now - t < 600]
+    if len(attempts) >= 8:
+        return jsonify(error="Слишком много попыток. Подождите 10 минут."), 429
+    attempts.append(now); remote_attempts[ip] = attempts
+    code = str((request.get_json(silent=True) or {}).get("code", ""))
+    with lock:
+        item = remote_codes.pop(code, None)
+        if not item or item["expires"] < now:
+            db.execute("delete from remote_codes where code=?", (code,)); db.commit()
+            return jsonify(error="Неверный или просроченный код"), 400
+        d = remote_devices.get(item["device"])
+        if not d:
+            return jsonify(error="Питомец не найден"), 400
+        token = secrets.token_urlsafe(48); remote_tokens[hashlib.sha256(token.encode()).hexdigest()] = (item["device"], uid())
+        d["owner"] = uid(); d["paired"] = True; d["wake"].set()
+        db.execute("delete from remote_codes where code=?", (code,))
+        db.execute("insert into remote_tokens(token_hash,device,owner) values(?,?,?)",
+                   (hashlib.sha256(token.encode()).hexdigest(), item["device"], uid()))
+        db.execute("update remote_devices set owner=?,paired=1 where id=?", (uid(), item["device"]))
+        db.commit()
+    return jsonify(token=token, name=d["name"])
+
+
+@app.post("/api/remote/agent/poll")
+def remote_agent_poll():
+    d = _remote_device_auth(request.get_json(silent=True) or {})
+    if not d: return jsonify(error="auth"), 401
+    d["online"] = True; d["last"] = time.time()
+    with lock:
+        if d["paired"]:
+            d["paired"] = False; db.execute("update remote_devices set paired=0 where id=?", (str((request.get_json(silent=True) or {}).get("device", "")),)); db.commit()
+            return jsonify(paired=True, linked=bool(d["owner"]))
+        if d["queue"]: return jsonify(cmd=d["queue"].pop(0), linked=bool(d["owner"]))
+        d["wake"].clear()
+    d["wake"].wait(20)
+    d["online"] = True; d["last"] = time.time()
+    with lock:
+        if d["paired"]:
+            d["paired"] = False; db.execute("update remote_devices set paired=0 where id=?", (str((request.get_json(silent=True) or {}).get("device", "")),)); db.commit()
+            return jsonify(paired=True, linked=bool(d["owner"]))
+        if d["queue"]: return jsonify(cmd=d["queue"].pop(0), linked=bool(d["owner"]))
+    return jsonify(cmd=None, linked=bool(d["owner"]))
+
+
+@app.post("/api/remote/agent/result")
+def remote_agent_result():
+    b = request.get_json(silent=True) or {}; d = _remote_device_auth(b)
+    if not d: return jsonify(error="auth"), 401
+    pending = d["pending"].get(str(b.get("id", "")))
+    if pending:
+        pending["result"] = b; pending["event"].set()
+    return jsonify(ok=True)
+
+
+@app.post("/api/remote/agent/say")
+def remote_agent_say():
+    """Queue a message sent by the Mac pet for the paired Velora chat UI."""
+    b = request.get_json(silent=True) or {}; d = _remote_device_auth(b)
+    if not d: return jsonify(error="auth"), 401
+    text = str(b.get("text", "")).strip()[:2000]
+    if not text: return jsonify(error="Пустое сообщение"), 400
+    if not d.get("paired") and not d.get("owner"):
+        return jsonify(error="Сначала подключите Mac кодом сопряжения"), 409
+    with lock:
+        if len(d["inbox"]) >= 20: d["inbox"].pop(0)
+        d["inbox"].append(text)
+    return jsonify(ok=True)
+
+
+@app.get("/api/remote/status")
+def remote_status():
+    item, d = _remote_user()
+    if not item or not d: return jsonify(error="Не подключено"), 401
+    return jsonify(online=bool(d["online"] and time.time()-d["last"] < 35), name=d["name"], allowShell=False)
+
+
+@app.get("/api/remote/inbox")
+def remote_inbox():
+    item, d = _remote_user()
+    if not item or not d: return jsonify(error="Не подключено"), 401
+    with lock:
+        msgs = list(d["inbox"]); d["inbox"].clear()
+    return jsonify(msgs=msgs)
+
+
+@app.post("/api/remote/unpair")
+def remote_unpair():
+    item, d = _remote_user()
+    if not item: return jsonify(error="Не подключено"), 401
+    token_hash = hashlib.sha256(request.headers.get("Authorization", "").removeprefix("Bearer ").encode()).hexdigest()
+    remote_tokens.pop(token_hash, None); db.execute("delete from remote_tokens where token_hash=?", (token_hash,))
+    if d: d["owner"] = None; d["queue"].clear(); db.execute("update remote_devices set owner=null,paired=0 where id=?", (item[0],))
+    db.commit()
+    return jsonify(ok=True)
+
+
+@app.post("/api/remote/cmd")
+def remote_cmd():
+    item, d = _remote_user()
+    if not item or not d: return jsonify(error="Не подключено"), 401
+    if not d["online"] or time.time()-d["last"] > 35: return jsonify(error="Mac не в сети"), 503
+    b = request.get_json(silent=True) or {}; typ = str(b.get("type", ""))
+    if typ not in {"status", "screenshot", "open-app", "open-url", "volume", "lock", "sleep", "overlay", "ask"}:
+        return jsonify(error="Неизвестная команда"), 400
+    if typ == "overlay":
+        event = {"t": "status", "id": str(b.get("key") or uuid.uuid4().hex)[:80],
+                 "title": str(b.get("title") or "Velora")[:120],
+                 "sub": str(b.get("sub") or "")[:2000],
+                 "mood": str(b.get("mood") or "happy")[:24],
+                 "ttl": min(max(int(b.get("ttl") or 5000), 1000), 60000)}
+        with lock:
+            if len(d["queue"]) >= 50: d["queue"].pop(0)
+            d["queue"].append(event); d["wake"].set()
+        return jsonify(ok=True)
+    ident = uuid.uuid4().hex; ev = threading.Event(); d["pending"][ident] = {"event":ev}
+    name = {"open-app":"open_app", "open-url":"open_url"}.get(typ, typ)
+    if name not in {"status", "screenshot", "open_app", "open_url"}: return jsonify(error="Команда пока не поддерживается агентом"), 400
+    d["queue"].append({"t":"tool", "id":ident, "name":name, "args":b})
+    d["wake"].set()
+    # Electron adapter will report results asynchronously. Keep request bounded.
+    if not ev.wait(30):
+        d["pending"].pop(ident, None); return jsonify(error="Mac не ответил"), 504
+    result = d["pending"].pop(ident, {}).get("result", {})
+    return jsonify(data=result.get("output", result), mime=result.get("mime", "text/plain"))
 
 
 @app.post("/api/chat")
@@ -2315,4 +2508,4 @@ def startup_report():
 startup_report()
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")), threaded=True)
+    app.run(host=os.getenv("HOST", "0.0.0.0"), port=int(os.getenv("PORT", "8080")), threaded=True)
