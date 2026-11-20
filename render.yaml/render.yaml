@@ -4,8 +4,5 @@ services:
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: python render_entry.py
+    startCommand: python server.py
     healthCheckPath: /health
-    envVars:
-      - key: ALLOW_BROWSER
-        value: "1"
