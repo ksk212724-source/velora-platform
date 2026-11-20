@@ -4397,7 +4397,7 @@ document.addEventListener('pointerdown',e=>{if(e.target.closest&&e.target.closes
 window.addEventListener('load',()=>setTimeout(()=>post('ready',1),500));
 /* --- удалённый доступ к ноутбуку --- */
 const RK='velora_remote',api=()=>window.VELORA_REMOTE||window.VELORA_API,tok=()=>{try{return localStorage.getItem(RK)||''}catch{return''}};
-async function rc(path,body){try{const r=await fetch(api()+path,{method:body?'POST':'GET',headers:{'Content-Type':'application/json',Authorization:'Bearer '+tok()},body:body?JSON.stringify(body):undefined});let j={};try{j=await r.json()}catch{}return{ok:r.ok,j}}catch(e){return{ok:false,j:{error:'Нет связи с сервером'}}}}
+async function rc(path,body){try{const r=await fetch(api()+path,{method:body?'POST':'GET',headers:{...headers(),Authorization:'Bearer '+tok()},body:body?JSON.stringify(body):undefined});let j={};try{j=await r.json()}catch{}return{ok:r.ok,j}}catch(e){return{ok:false,j:{error:'Нет связи с сервером'}}}}
 function panel(){
  let w=document.getElementById('vrWrap');if(w){w.classList.add('on');w._refresh&&w._refresh();return}
  w=document.createElement('div');w.id='vrWrap';w.className='vr-wrap';
